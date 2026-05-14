@@ -189,11 +189,3 @@ uv run pytest tests/prompts/test_estimation_v1.py -v
 
 El archivo `app/context/examples.py` es legado del primer ejercicio; los ejemplos few-shot activos están en los `.j2` dentro de `app/prompts/`.
 
-## Checklist rápido
-
-- [ ] `.env` creado a partir de `.env.example` y clave del proveedor elegido rellenada
-- [ ] `GET /health` responde 200
-- [ ] `POST /estimate` con un JSON válido devuelve `text` y `prompt_version`
-- [ ] `/docs` abre y el esquema coincide con `EstimationRequest`
-- [ ] Streamlit puede alcanzar la API (`ESTIMATOR_API_BASE` si no usas el puerto por defecto)
-- [ ] `.env` no se sube al repositorio (suele ignorarse con `.gitignore`)

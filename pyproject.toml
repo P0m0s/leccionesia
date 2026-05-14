@@ -1,0 +1,30 @@
+[project]
+name = "estimador-cag"
+version = "0.1.0"
+description = "API FastAPI con CAG para estimaciones de software vía LLM"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "pydantic-settings>=2.6.0",
+    "openai>=1.57.0",
+    "anthropic>=0.40.0",
+    "python-dotenv>=1.0.0",
+    "streamlit>=1.40.0",
+    "jinja2>=3.1.4",
+    "structlog>=24.4.0",
+    "httpx>=0.27.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]

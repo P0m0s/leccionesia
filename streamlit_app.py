@@ -94,7 +94,18 @@ _DEFAULTS = {
     "chat_use_refine": False,
     "chat_last_structured": None,
     "chat_last_attachments_processed": [],
+    "chat_tier": "conversational",
+    "chat_user_id": "demo-user",
 }
+
+TIER_OPTIONS: list[tuple[str, str]] = [
+    ("conversational", "💬 Conversacional (sin tier)"),
+    ("developer", "🛠️ Developer (técnico)"),
+    ("pm", "🧭 PM (gestión)"),
+    ("executive", "💼 Executive (1 página)"),
+    ("research", "🔬 Research (informe profundo)"),
+]
+TIER_LABELS = dict(TIER_OPTIONS)
 for k, v in _DEFAULTS.items():
     if k not in st.session_state:
         st.session_state[k] = v
@@ -323,6 +334,7 @@ def _apply_turn_to_history(
     assistant_text: str,
     structured: dict[str, Any] | None,
     command: str,
+    tier: str | None = None,
 ) -> None:
     """Aplica el resultado de un turno al historial del frontend.
 
@@ -334,6 +346,7 @@ def _apply_turn_to_history(
         "role": "assistant",
         "content": assistant_text,
         "structured": structured,
+        "tier": tier,
     }
     history = st.session_state["chat_history"]
 
@@ -352,6 +365,219 @@ def _apply_turn_to_history(
 
     history.append({"role": "user", "content": user_label})
     history.append(assistant_turn)
+
+
+_CONFIDENCE_LEVEL_ICON = {"low": "🔴", "medium": "🟡", "high": "🟢"}
+_GO_NO_GO_BADGE = {
+    "go": ("🟢", "GO"),
+    "conditional_go": ("🟡", "GO con condiciones"),
+    "no_go": ("🔴", "NO GO"),
+}
+
+
+def _render_tier_developer(s: dict[str, Any]) -> None:
+    rng = s.get("total_hours_range") or {}
+    if rng:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("⏱️ Horas (mín)", f"{rng.get('min', 0):.0f} h")
+        c2.metric("⏱️ Horas (máx)", f"{rng.get('max', 0):.0f} h")
+        mid = ((rng.get("min", 0) or 0) + (rng.get("max", 0) or 0)) / 2
+        c3.metric("📌 Punto medio", f"{mid:.0f} h")
+
+    comps = s.get("components") or []
+    if comps:
+        with st.expander(f"🧱 Componentes técnicos ({len(comps)})", expanded=True):
+            rows = []
+            for c in comps:
+                r = c.get("hours_range") or {}
+                rows.append(
+                    {
+                        "name": c.get("name"),
+                        "complexity": c.get("complexity"),
+                        "hours_min": r.get("min"),
+                        "hours_max": r.get("max"),
+                        "description": c.get("description"),
+                    },
+                )
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        risks = s.get("technical_risks") or []
+        if risks:
+            st.markdown(f"**⚠️ Riesgos técnicos** ({len(risks)})")
+            for r in risks:
+                mit = r.get("mitigation")
+                mit_str = f" — _Mitigación: {mit}_" if mit else ""
+                st.markdown(f"- {r.get('description', '')}{mit_str}")
+    with col_b:
+        unc = s.get("uncertainty_drivers") or []
+        if unc:
+            st.markdown(f"**🎲 Drivers de incertidumbre** ({len(unc)})")
+            for u in unc:
+                st.markdown(f"- {u}")
+
+    stack = s.get("stack_assumptions") or []
+    if stack:
+        st.markdown(f"**🧰 Supuestos de stack** ({len(stack)})")
+        st.markdown("\n".join(f"- {x}" for x in stack))
+
+
+def _render_tier_pm(s: dict[str, Any]) -> None:
+    rng = s.get("duration_weeks_range") or {}
+    phases = s.get("phases") or []
+    milestones = s.get("milestones") or []
+    team = s.get("team_composition") or []
+    if rng:
+        c1, c2, c3 = st.columns(3)
+        c1.metric("📆 Semanas (mín)", f"{rng.get('min', 0):.0f}")
+        c2.metric("📆 Semanas (máx)", f"{rng.get('max', 0):.0f}")
+        c3.metric("👥 Roles", len(team))
+
+    if phases:
+        with st.expander(f"🚦 Fases ({len(phases)})", expanded=True):
+            rows = []
+            for p in phases:
+                d = p.get("duration_weeks") or {}
+                rows.append(
+                    {
+                        "name": p.get("name"),
+                        "weeks_min": d.get("min"),
+                        "weeks_max": d.get("max"),
+                        "deliverables": ", ".join(p.get("deliverables") or []),
+                        "dependencies": ", ".join(p.get("dependencies") or []),
+                    },
+                )
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    if milestones:
+        with st.expander(f"🏁 Hitos ({len(milestones)})", expanded=True):
+            rows = [
+                {
+                    "name": m.get("name"),
+                    "week": m.get("week"),
+                    "deliverables": ", ".join(m.get("deliverables") or []),
+                }
+                for m in milestones
+            ]
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    if team:
+        with st.expander(f"👥 Composición del equipo ({len(team)})"):
+            st.dataframe(pd.DataFrame(team), use_container_width=True, hide_index=True)
+
+    blockers = s.get("blockers") or []
+    if blockers:
+        st.markdown(f"**🚧 Blockers** ({len(blockers)})")
+        for b in blockers:
+            sev = b.get("impact")
+            icon = _SEVERITY_ICONS.get(sev or "", "•")
+            st.markdown(f"- {icon} {b.get('description', '')} _({sev})_")
+
+
+def _render_tier_executive(s: dict[str, Any]) -> None:
+    cost = s.get("headline_cost_range") or {}
+    dur = s.get("headline_duration_range") or {}
+    rec = s.get("go_no_go_recommendation")
+    badge_icon, badge_label = _GO_NO_GO_BADGE.get(rec or "", ("•", rec or "—"))
+
+    c1, c2, c3 = st.columns([2, 2, 3])
+    c1.metric("💶 Coste", f"{cost.get('min', 0):,} – {cost.get('max', 0):,} €")
+    c2.metric("📆 Duración", f"{dur.get('min', 0):.0f} – {dur.get('max', 0):.0f} sem.")
+    c3.metric("📊 Recomendación", f"{badge_icon} {badge_label}")
+
+    conf = s.get("confidence_level")
+    if conf:
+        icon = _CONFIDENCE_LEVEL_ICON.get(conf, "•")
+        st.caption(f"{icon} Confianza **{conf}**")
+
+    rationale = s.get("rationale")
+    if rationale:
+        st.markdown("**📝 Rationale**")
+        st.info(rationale)
+
+    risks = s.get("top_three_risks") or []
+    if risks:
+        st.markdown(f"**⚠️ Riesgos clave** ({len(risks)})")
+        for r in risks:
+            st.markdown(f"- **{r.get('headline', '')}** — {r.get('impact', '')}")
+
+
+def _render_tier_research(s: dict[str, Any]) -> None:
+    title = s.get("title")
+    if title:
+        st.markdown(f"### 📄 {title}")
+
+    rng_h = s.get("total_hours_range") or {}
+    rng_c = s.get("total_cost_range") or {}
+    conf = s.get("confidence_level")
+    c1, c2, c3 = st.columns(3)
+    if rng_h:
+        c1.metric("⏱️ Horas", f"{rng_h.get('min', 0):.0f} – {rng_h.get('max', 0):.0f}")
+    if rng_c:
+        c2.metric("💶 Coste", f"{rng_c.get('min', 0):,} – {rng_c.get('max', 0):,} €")
+    if conf:
+        icon = _CONFIDENCE_LEVEL_ICON.get(conf, "•")
+        c3.metric("📊 Confianza", f"{icon} {conf}")
+
+    summary = s.get("executive_summary")
+    if summary:
+        st.info(summary)
+
+    toc = s.get("table_of_contents") or []
+    if toc:
+        with st.expander("📑 Índice", expanded=False):
+            for i, t in enumerate(toc, 1):
+                st.markdown(f"{i}. {t}")
+
+    for section in s.get("sections") or []:
+        with st.expander(f"**{section.get('title', 'Sección')}**", expanded=True):
+            st.markdown(section.get("content_markdown") or "")
+            citations = section.get("citations") or []
+            if citations:
+                st.caption("**Citas:**")
+                for c in citations:
+                    url = c.get("url")
+                    src = c.get("source", "")
+                    quote = c.get("quote")
+                    line = f"- {src}" + (f" — _{quote}_" if quote else "")
+                    if url:
+                        line += f" · [{url}]({url})"
+                    st.markdown(line)
+
+    method = s.get("methodology")
+    if method:
+        st.markdown("**🧪 Metodología**")
+        st.markdown(method)
+
+    steps = s.get("next_steps") or []
+    if steps:
+        st.markdown("**👉 Siguientes pasos**")
+        for s_ in steps:
+            st.markdown(f"- {s_}")
+
+
+_TIER_RENDERERS: dict[str, Any] = {
+    "developer": _render_tier_developer,
+    "pm": _render_tier_pm,
+    "executive": _render_tier_executive,
+    "research": _render_tier_research,
+}
+
+
+def _render_assistant_turn(turn: dict[str, Any]) -> None:
+    """Despacha el render del turno del asistente según el tier."""
+    tier = turn.get("tier")
+    structured = turn.get("structured")
+    content = turn.get("content", "")
+    if tier in _TIER_RENDERERS and isinstance(structured, dict):
+        st.markdown(_clean_summary_markdown(content))
+        _TIER_RENDERERS[tier](structured)
+        return
+    if structured:
+        _render_structured(structured, content)
+        return
+    st.markdown(_clean_summary_markdown(content))
 
 
 def _http_error_message(err: httpx.HTTPStatusError) -> str:
@@ -468,35 +694,58 @@ tab_chat, tab_form, tab_transcript = st.tabs(
 )
 
 with tab_chat:
+    tier_keys = [k for k, _ in TIER_OPTIONS]
+    tier_labels_list = [lbl for _, lbl in TIER_OPTIONS]
+    current_tier = st.session_state["chat_tier"]
+    tier_index = tier_keys.index(current_tier) if current_tier in tier_keys else 0
+    selected_tier_label = st.selectbox(
+        "Perfil del cliente (tier)",
+        options=tier_labels_list,
+        index=tier_index,
+        help=(
+            "Cambia template, schema y pipeline según el perfil del receptor. "
+            "En producción este tier vendría de tu sistema de auth, no de un dropdown."
+        ),
+    )
+    st.session_state["chat_tier"] = tier_keys[tier_labels_list.index(selected_tier_label)]
+    active_tier = st.session_state["chat_tier"]
+    tier_is_active = active_tier != "conversational"
+
     cfg_cols = st.columns([2, 2, 2, 2])
     with cfg_cols[0]:
         st.session_state["chat_prompt_version"] = st.selectbox(
             "Prompt",
             options=("v1", "v2"),
             index=0 if st.session_state["chat_prompt_version"] == "v1" else 1,
-            help="v1 estándar, v2 adversarial (cuestiona supuestos).",
+            help="v1 estándar, v2 adversarial. Solo aplica al modo conversacional.",
+            disabled=tier_is_active,
         )
     with cfg_cols[1]:
         st.session_state["chat_use_stream"] = st.checkbox(
             "Streaming",
-            value=st.session_state["chat_use_stream"],
+            value=st.session_state["chat_use_stream"] and not tier_is_active,
+            help="No disponible en modo tier (la salida es JSON estricto).",
+            disabled=tier_is_active,
         )
     with cfg_cols[2]:
         st.session_state["chat_use_refine"] = st.checkbox(
             "Auto-crítica",
             value=st.session_state["chat_use_refine"],
             help="Doble pasada de revisión. Duplica latencia y tokens.",
-            disabled=st.session_state["chat_use_stream"],
+            disabled=st.session_state["chat_use_stream"] or tier_is_active,
         )
     with cfg_cols[3]:
         st.caption("Comandos: `/help`, `/reset`, `/metadata`, `/regenerate`.")
+    if tier_is_active:
+        st.info(
+            f"🎯 Modo tier activo: **{TIER_LABELS[active_tier]}**. "
+            "Cada turno usa template + schema + pipeline específicos."
+        )
 
     for turn in st.session_state["chat_history"]:
         with st.chat_message(turn["role"]):
-            if turn.get("structured") and turn["role"] == "assistant":
-                _render_structured(turn["structured"], turn["content"])
-            elif turn["role"] == "assistant":
-                st.markdown(_clean_summary_markdown(turn["content"]))
+            if turn["role"] == "assistant":
+                _render_assistant_turn(turn)
             else:
                 st.markdown(turn["content"])
 
@@ -547,7 +796,13 @@ with tab_chat:
                 if st.session_state["chat_use_refine"] and not st.session_state["chat_use_stream"]:
                     params["refine"] = "true"
 
-                if st.session_state["chat_use_stream"]:
+                tier_headers: dict[str, str] = {}
+                if tier_is_active:
+                    tier_headers["X-Estimator-Tier"] = active_tier
+                    tier_headers["X-Estimator-User"] = st.session_state["chat_user_id"]
+
+                use_stream = st.session_state["chat_use_stream"] and not tier_is_active
+                if use_stream:
                     stream_url = f"{API_BASE}/sessions/{current_sid}/estimate/stream"
                     user_label = cleaned or "(adjuntos sin transcript)"
 
@@ -627,12 +882,14 @@ with tab_chat:
                         )
                 else:
                     try:
-                        with httpx.Client(timeout=300.0) as client:
+                        timeout_s = 600.0 if active_tier == "research" else 300.0
+                        with httpx.Client(timeout=timeout_s) as client:
                             r = client.post(
                                 f"{API_BASE}/sessions/{current_sid}/estimate",
                                 params=params,
                                 data=data_payload,
                                 files=files_payload or None,
+                                headers=tier_headers or None,
                             )
                             r.raise_for_status()
                             data = r.json()
@@ -642,6 +899,7 @@ with tab_chat:
                             assistant_text=data.get("text", ""),
                             structured=data.get("structured"),
                             command=cleaned,
+                            tier=data.get("tier"),
                         )
                         st.session_state["chat_project_metadata"] = data.get(
                             "project_metadata", {},

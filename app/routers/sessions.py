@@ -15,7 +15,7 @@ import json
 from collections.abc import Iterator
 from typing import Literal
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import StreamingResponse
 
 ChatPromptVersion = Literal["v1", "v2"]
@@ -40,6 +40,12 @@ from app.services.session_service import (
 from app.services.slash_commands import dispatch as dispatch_command
 from app.services.slash_commands import is_command
 from app.sessions import MAX_TURNS, session_store
+from app.tiers import (
+    PIPELINE_HANDLERS,
+    CallerContext,
+    get_caller_context,
+    resolve_tier_config,
+)
 
 router = APIRouter(tags=["sessions"])
 
@@ -139,13 +145,15 @@ async def session_estimate(
         default=False,
         description=(
             "Si True, hace una segunda pasada de auto-crítica antes de devolver "
-            "la estimación. Duplica latencia y tokens."
+            "la estimación. Duplica latencia y tokens. Solo aplica al flujo "
+            "conversacional clásico (sin tier)."
         ),
     ),
     prompt_version: ChatPromptVersion = Query(
         default="v1",
         description="Versión del template conversacional (v1 estándar, v2 adversarial).",
     ),
+    caller: CallerContext | None = Depends(get_caller_context),
 ) -> SessionEstimateResponse:
     session = session_store.get(session_id)
     if session is None:
@@ -180,6 +188,38 @@ async def session_estimate(
             texts, images, failed = [], [], []
     else:
         texts, images, failed = await _read_and_extract(attachments)
+
+    if caller is not None:
+        try:
+            config = resolve_tier_config(caller.tier)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        handler = PIPELINE_HANDLERS[config["pipeline"]]
+        try:
+            tier_result = await handler(
+                config=config,
+                session=session,
+                transcript=transcript,
+                attachments=texts,
+                images=images,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        return SessionEstimateResponse(
+            session_id=session.session_id,
+            text=tier_result.summary_text,
+            structured=tier_result.structured.model_dump(),
+            structured_ok=True,
+            refined=False,
+            tier=caller.tier,
+            pipeline=tier_result.pipeline,
+            project_metadata=session.project_metadata.model_dump(),
+            metrics=session.metrics.model_dump(),
+            attachments_processed=[att.filename for att in texts] + [img.filename for img in images],
+            attachments_failed=failed,
+        )
 
     try:
         turn = run_session_turn(

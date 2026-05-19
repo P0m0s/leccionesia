@@ -356,6 +356,8 @@ Briefs canónicos en `app/eval/briefs.py`; el runner verifica `project_type` det
 | `app/services/metadata_llm.py` | Extractor LLM + summarizer del overflow. |
 | `app/services/slash_commands.py` | Dispatcher de comandos `/`. |
 | `app/services/cost.py` | Tabla de precios por modelo (USD por 1K tokens). |
+| `app/tiers/` | Patrón **tier**: `CallerContext`, `TIER_CONFIG`, schemas y pipelines por perfil. |
+| `app/prompts/tiers/` | Templates Jinja2 por tier + parciales compartidos. |
 | `app/eval/` | Eval set de briefs canónicos. |
 | `app/frontend_utils.py` | Tarjetas, parseo de tablas markdown y export Markdown/PDF. |
 | `.streamlit/config.toml` | Theming corporativo. |
@@ -364,4 +366,97 @@ Briefs canónicos en `app/eval/briefs.py`; el runner verifica `project_type` det
 | `.github/workflows/ci.yml` | Tests + ruff en GitHub Actions. |
 
 El archivo `app/context/examples.py` es legado del primer ejercicio; los ejemplos few-shot activos están en los `.j2` dentro de `app/prompts/`.
+
+## Patrón tier — perfiles adaptativos de cliente
+
+Implementación del ejercicio *Prompts adaptativos por perfil de usuario* (módulo AI Engineering 2026/04). Una misma sesión conversacional puede responder al mismo brief con estructuras, vocabulario y pipelines **distintos** según el perfil del receptor.
+
+### Qué es un tier
+
+Un tier es una etiqueta sobre el `caller` que selecciona simultáneamente:
+
+| Tier | Pipeline | Schema Pydantic | Template Jinja2 | Audiencia |
+|------|----------|-----------------|------------------|-----------|
+| `developer` | `single_call` | `DeveloperEstimate` | `tiers/developer.j2` | Ingenieros — componentes, riesgos técnicos, stack, drivers de incertidumbre. |
+| `pm` | `single_call` | `PmEstimate` | `tiers/pm.j2` | PMs — fases, hitos, composición de equipo, blockers. |
+| `executive` | `single_call` | `ExecutiveEstimate` | `tiers/executive.j2` | C-level — coste/duración headline, top-3 riesgos, go/no-go. |
+| `research` | `deep_research` | `ResearchEstimate` | `tiers/research.j2` | Informe profundo con índice, secciones, citas y metodología. |
+
+La fuente de verdad única está en `app/tiers/config.py::TIER_CONFIG`. Añadir un tier nuevo = una entrada en ese dict + un template + un schema.
+
+### Cómo se propaga el tier
+
+El backend **nunca** confía en un campo "suelto" en el body. La identidad llega siempre como un `CallerContext` construido por una dependency de FastAPI (`Depends(get_caller_context)`):
+
+```python
+class CallerContext(BaseModel):
+    user_id: str
+    tier: Literal["developer", "pm", "executive", "research"]
+```
+
+Hay dos estrategias canónicas, implementadas en `app/tiers/context.py`:
+
+- **Opción B (activa)** — Headers simples en red privada. La dependency lee `X-Estimator-Tier` y `X-Estimator-User`. Apta para MVP / red de confianza. Si el header no llega, la dependency devuelve `None` y el endpoint cae al **flujo conversacional clásico** (compat hacia atrás).
+- **Opción A (comentada)** — JWT firmado. Lista para activar: descomentar `get_caller_context_jwt`, instalar `python-jose[cryptography]` y configurar `ESTIMATOR_JWT_SECRET`. El frontend o el API gateway emite tokens con `sub` y `tier` como claims.
+
+> **Nota sobre el frontend del MVP**: como aún no hay sistema de auth, el dropdown del Streamlit envía el tier directamente en el header. En producción se reemplaza la dependency por la versión JWT sin tocar el endpoint ni los pipelines.
+
+### Cómo funciona cada pipeline
+
+Definidas en `app/tiers/pipelines.py`:
+
+- **`single_call`**: render del template tier → construir `[system, ...history]` → 1 llamada al LLM → validar contra el schema Pydantic del tier → añadir al historial. Memoria conversacional preservada igual que el flujo clásico.
+- **`deep_research`**: misma estructura pero pensada para `o3-deep-research` con `web_search` y `code_interpreter` en background. Mientras no haya acceso a esa API, hace la llamada al provider configurado por defecto usando el template de investigación, que ya pide informe extenso con índice, secciones, citas y metodología.
+
+`TIER_CONFIG["research"]` marca `background: true`, `estimated_latency_seconds: 600` y `estimated_cost_per_call_eur: 5.0` para que el frontend pueda advertir al usuario antes de disparar la pipeline.
+
+### Cómo se usa desde el frontend
+
+En la pestaña de Conversación hay un selector **Perfil del cliente (tier)** con 5 opciones:
+
+1. `💬 Conversacional (sin tier)` — no envía header → flujo clásico (`StructuredEstimation`).
+2. `🛠️ Developer` — envía `X-Estimator-Tier: developer`.
+3. `🧭 PM` — `pm`.
+4. `💼 Executive` — `executive`.
+5. `🔬 Research` — `research` (lento/caro, deshabilita streaming).
+
+Al cambiar de tier dentro de una misma sesión, **el historial se conserva**: puedes pedir lo mismo desde el punto de vista de un PM y después como executive para comparar.
+
+Cada tier renderiza diferente en Streamlit:
+
+- **Developer**: 3 métricas de horas, tabla de componentes, riesgos técnicos vs drivers de incertidumbre, supuestos de stack.
+- **PM**: métricas de semanas/roles, tabla de fases, tabla de hitos, composición del equipo, blockers con icono de severidad.
+- **Executive**: 3 metricas grandes (coste, duración, recomendación con badge), confianza, rationale, top-3 riesgos.
+- **Research**: cabecera con totales, índice plegable, cada sección en su propio expander con citas, metodología, siguientes pasos.
+
+### Cómo añadir un tier nuevo
+
+1. Define un schema en `app/tiers/schemas.py` con la estructura específica.
+2. Crea `app/prompts/tiers/<nombre>.j2`. Reutiliza `{% include "tiers/_project_metadata.j2" %}` y `{% include "tiers/_reference_estimates.j2" %}` para mantener la disciplina de parciales.
+3. Añade la entrada a `TIER_CONFIG` con `pipeline`, `template`, `schema` y `model`. Si necesita una pipeline nueva, regístrala en `PIPELINE_HANDLERS`.
+4. Añade el tier al `Literal` en `CallerContext.tier` y al `frozenset` `_VALID_TIERS` de `app/tiers/context.py`.
+5. Frontend: añade una entrada a `TIER_OPTIONS` y, si quieres render rico, un `_render_tier_<nombre>` en `streamlit_app.py`.
+
+### Anti-patrones evitados
+
+- ❌ **Tier desde frontend sin verificación**: el backend valida vía dependency; en el MVP el dropdown envía un header pero la migración a JWT es trivial.
+- ❌ **Schema único con branching**: 4 schemas Pydantic genuinamente distintos (`components` solo en Developer; `phases` solo en PM; `headline_cost_range` solo en Executive; `sections` solo en Research).
+- ❌ **Templates divergentes sin includes**: todos los `tiers/*.j2` reutilizan `_project_metadata.j2` y `_reference_estimates.j2`.
+- ❌ **Cambiar solo el tono**: cada tier cambia *estructura* + *vocabulario* + (en research) *pipeline*. Un Developer ve `components`, un Executive ve `headline_cost_range` y `go_no_go_recommendation`.
+
+### Ejemplo de uso con `curl`
+
+```bash
+# Crear sesión
+SID=$(curl -s -X POST http://127.0.0.1:8000/sessions | jq -r .session_id)
+
+# Mismo brief, tres perfiles distintos
+for TIER in developer pm executive; do
+  curl -s -X POST "http://127.0.0.1:8000/sessions/$SID/estimate" \
+    -H "X-Estimator-Tier: $TIER" \
+    -H "X-Estimator-User: julio" \
+    -d "transcript=Plataforma SaaS de gestión de gastos para PYMEs. Multi-tenant." \
+    | jq '{tier, pipeline, structured_keys: (.structured | keys)}'
+done
+```
 

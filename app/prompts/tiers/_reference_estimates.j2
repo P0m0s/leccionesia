@@ -1,0 +1,15 @@
+{# Parcial compartido: tabla de calibración t-shirt. #}
+## Calibración de esfuerzo (referencia interna)
+
+| Talla | Horas (rango) | Ejemplos típicos |
+|-------|---------------|-------------------|
+| **XS** | 4 – 8 h | endpoint trivial, ajuste de copy |
+| **S** | 16 – 40 h | CRUD pequeño, integración SDK estándar |
+| **M** | 60 – 120 h | módulo funcional completo, webhook bidireccional |
+| **L** | 160 – 280 h | subsistema (pagos, identidad), ETL nuevo |
+| **XL** | 320 – 600+ h | MVP completo, replatforming, migración pesada |
+
+Reglas:
+- Siempre da **rangos** (`min`, `max`), nunca números puntuales.
+- Respeta el rango asociado a cada talla.
+- Si un ítem sale del XL, divídelo en componentes más pequeños.

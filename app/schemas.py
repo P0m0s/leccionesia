@@ -59,6 +59,17 @@ class SessionEstimateResponse(BaseModel):
         default=False,
         description="True si el turno pasó por la fase de auto-crítica (`refine`).",
     )
+    tier: str | None = Field(
+        default=None,
+        description=(
+            "Tier que se usó para construir la respuesta (developer, pm, executive, "
+            "research) o `None` si se usó el flujo conversacional clásico."
+        ),
+    )
+    pipeline: str | None = Field(
+        default=None,
+        description="Pipeline ejecutado (`single_call` o `deep_research`).",
+    )
     project_metadata: dict
     metrics: dict = Field(default_factory=dict)
     attachments_processed: list[str] = Field(default_factory=list)

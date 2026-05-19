@@ -77,6 +77,10 @@ def fake_llm(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         "app.services.session_service.generate_chat_messages",
         _fake,
     )
+    monkeypatch.setattr(
+        "app.tiers.pipelines.generate_chat_messages",
+        _fake,
+    )
     return state
 
 

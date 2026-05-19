@@ -36,3 +36,40 @@ class EstimationRequest(BaseModel):
 class EstimationResponse(BaseModel):
     text: str
     prompt_version: str
+
+
+class SessionCreateResponse(BaseModel):
+    session_id: str
+
+
+class SessionEstimateResponse(BaseModel):
+    session_id: str
+    text: str = Field(
+        description="Resumen markdown (compatibilidad). Equivale a structured.summary_markdown.",
+    )
+    structured: dict | None = Field(
+        default=None,
+        description="Estimación estructurada cuando el LLM devolvió JSON parseable.",
+    )
+    structured_ok: bool = Field(
+        default=False,
+        description="True si el LLM devolvió un JSON válido conforme al schema.",
+    )
+    refined: bool = Field(
+        default=False,
+        description="True si el turno pasó por la fase de auto-crítica (`refine`).",
+    )
+    project_metadata: dict
+    metrics: dict = Field(default_factory=dict)
+    attachments_processed: list[str] = Field(default_factory=list)
+    attachments_failed: list[dict] = Field(default_factory=list)
+
+
+class SessionStateResponse(BaseModel):
+    """Estado completo de una sesión para rehidratar UIs."""
+
+    session_id: str
+    project_metadata: dict
+    messages: list[dict]
+    max_turns: int
+    metrics: dict = Field(default_factory=dict)

@@ -1,0 +1,11 @@
+Modo **adversarial refine**: revisa tu propia respuesta con ojo crítico extremo.
+
+1. **¿Qué supuestos diste por hecho que el usuario NO confirmó?** Lista cada uno explícitamente y márcalo como `assumption`.
+2. **¿Qué riesgos olvidaste?** Especialmente humanos / organizativos / dependencias externas.
+3. **¿Tus cifras están dentro del rango correcto de la talla T-shirt?** Si no, ajústalas.
+4. **¿El `confidence` que diste es realmente justificable?** En la duda, **bájalo**.
+5. **¿La división en line_items es real o trivial?** Une lo que se solapa, divide lo monolítico.
+
+Reescribe la estimación entera en el mismo schema JSON. Añade al final del `summary_markdown` una sección `## Cambios respecto a la versión anterior` con 3-5 viñetas.
+
+Si la versión anterior es esencialmente correcta, dilo y sube ligeramente `confidence`.

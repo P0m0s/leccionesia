@@ -1,0 +1,23 @@
+## Ejemplos de referencia (estilo, no copies cifras) — dominio **data_pipeline**
+
+### Ejemplo — pipeline analítico desde ERP legado
+**Entrada:** "ETL incremental desde un ERP legado hacia data warehouse con validaciones de calidad y alertas."
+
+**Áreas típicas a incluir como line_items:**
+- Conector al origen (CDC vs query incremental) (M)
+- Modelado en el warehouse (raw → staging → marts) (M–L)
+- Orquestación (Airflow/Dagster/Prefect) (M)
+- Validaciones de calidad (Great Expectations, soda-core) (S–M)
+- Alertas + observabilidad (S)
+- Documentación de linaje (S)
+
+**Riesgos típicos del dominio:**
+- Cambios de esquema en el origen sin previo aviso.
+- Volumen mayor del estimado → cuellos en transformación.
+- Permisos/IAM con el sistema origen.
+- Drift de definiciones entre negocio e ingeniería.
+
+**Supuestos a marcar:**
+- ¿Batch (cada N horas) o casi-real-tiempo (CDC)?
+- ¿SLA de frescura comprometido con negocio?
+- ¿Almacén destino (BigQuery, Snowflake, Redshift, ClickHouse) ya elegido?

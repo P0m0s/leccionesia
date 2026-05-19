@@ -1,0 +1,22 @@
+## Ejemplos de referencia (estilo, no copies cifras) — dominio **internal_tool**
+
+### Ejemplo — herramienta interna de aprobaciones
+**Entrada:** "Portal interno para que managers aprueben gastos, con flujo multi-nivel y exportación contable."
+
+**Áreas típicas a incluir como line_items:**
+- Auth + integración con identidad corporativa (Azure AD / Okta) (S–M)
+- Modelo de datos del workflow (estados, transiciones) (M)
+- UI tipada con tabla maestra + detalle (M)
+- Motor de reglas / flujo (puede ser script vs librería como Camunda Lite) (M–L)
+- Exportación contable (SEPA / SAP / Excel) (S–M)
+- Auditoría inmutable (S)
+
+**Riesgos típicos del dominio:**
+- Cambios de proceso a mitad de desarrollo (negocio).
+- Dependencia de TI corporativo (accesos a SAP/AD).
+- Adopción interna: requiere training, no es free-market.
+
+**Supuestos a marcar:**
+- ¿Cuántos pasos en el flujo y cuántos roles?
+- ¿Necesita app móvil o solo web?
+- ¿Integración bidireccional con el ERP o solo lectura/escritura puntual?

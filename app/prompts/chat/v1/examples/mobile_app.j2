@@ -1,0 +1,22 @@
+## Ejemplos de referencia (estilo, no copies cifras) — dominio **mobile_app**
+
+### Ejemplo — app iOS+Android de reservas
+**Entrada:** "MVP para reservas de servicios con pago tarjeta, push notifications y panel admin web."
+
+**Áreas típicas a incluir como line_items:**
+- Diseño de flujos y pantallas clave (S–M)
+- Backend (usuarios, citas, disponibilidad) (M)
+- Integración pasarela de pago (S)
+- App móvil 2 plataformas (L) — desglosar por plataforma si hay nativo separado
+- Push notifications + deep links (S)
+- Panel admin mínimo (M)
+
+**Riesgos típicos del dominio:**
+- Revisión de stores (Apple/Play) y políticas IDFA.
+- Diferencias entre Android (fragmentación) e iOS (versiones soportadas).
+- Sincronización offline / reconciliación.
+
+**Supuestos a marcar:**
+- ¿Nativo (Swift/Kotlin), híbrido (Flutter/React Native) o web responsive?
+- ¿Push provider (FCM, APNs directo, OneSignal)?
+- ¿Stripe / Adyen / pasarela local?

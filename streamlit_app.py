@@ -1,15 +1,19 @@
 """
-Interfaz Streamlit: formulario tipado → POST /estimate, historial y streaming HTTP.
+Interfaz Streamlit: chat conversacional, formulario tipado y atajo transcripción.
+
 Ejecutar desde la raíz del proyecto:
 
     .\\.venv\\Scripts\\python -m streamlit run streamlit_app.py
 """
+
 from __future__ import annotations
 
+import io
 import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
@@ -20,15 +24,27 @@ from dotenv import load_dotenv
 load_dotenv(_ROOT / ".env")
 
 import httpx
+import pandas as pd
 import streamlit as st
 
-from app.prompts.loader import render_estimation_prompt
+from app.frontend_utils import (
+    conversation_to_markdown,
+    conversation_to_pdf,
+    metadata_card_specs,
+    parse_markdown_tables,
+)
+from app.prompts.loader import (
+    render_chat_system_prompt,
+    render_estimation_prompt,
+)
 from app.schemas import (
     DetailLevel,
     EstimationRequest,
     OutputFormat,
     ProjectType,
 )
+from app.services.attachments import extract_attachment_text, is_image_attachment
+from app.sessions import MAX_TURNS, ProjectMetadata
 
 
 def _apply_streamlit_secrets() -> None:
@@ -66,61 +82,588 @@ st.set_page_config(
     layout="wide",
 )
 
-if "response_history" not in st.session_state:
-    st.session_state["response_history"] = []
-if "last_metrics" not in st.session_state:
-    st.session_state["last_metrics"] = None
+_DEFAULTS = {
+    "response_history": [],
+    "last_metrics": None,
+    "chat_session_id": None,
+    "chat_history": [],
+    "chat_project_metadata": {},
+    "chat_session_metrics": {},
+    "chat_prompt_version": "v1",
+    "chat_use_stream": True,
+    "chat_use_refine": False,
+    "chat_last_structured": None,
+    "chat_last_attachments_processed": [],
+}
+for k, v in _DEFAULTS.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 API_BASE = os.environ.get("ESTIMATOR_API_BASE", "http://127.0.0.1:8000").rstrip("/")
 
+
+def _create_chat_session() -> str | None:
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            r = client.post(f"{API_BASE}/sessions")
+            r.raise_for_status()
+            sid = r.json().get("session_id")
+    except (httpx.HTTPError, httpx.RequestError) as e:
+        st.error(f"No se pudo crear la sesión: {e}")
+        return None
+    st.session_state["chat_session_id"] = sid
+    st.session_state["chat_history"] = []
+    st.session_state["chat_project_metadata"] = {}
+    st.session_state["chat_session_metrics"] = {}
+    st.session_state["chat_last_structured"] = None
+    return sid
+
+
+def _ensure_chat_session() -> str | None:
+    """Devuelve un ``session_id`` válido; valida contra el backend y lo recrea si caducó."""
+    sid = st.session_state.get("chat_session_id")
+    if not sid:
+        return _create_chat_session()
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            r = client.get(f"{API_BASE}/sessions/{sid}")
+        if r.status_code == 404:
+            st.info(
+                "La sesión previa ya no existe en el servidor (probablemente "
+                "se reinició). He creado una nueva."
+            )
+            return _create_chat_session()
+        r.raise_for_status()
+    except httpx.RequestError as e:
+        st.error(f"No se pudo contactar la API: {e}")
+        return None
+    except httpx.HTTPStatusError:
+        return _create_chat_session()
+    return sid
+
+
+def _reset_chat_session() -> None:
+    st.session_state["chat_session_id"] = None
+    st.session_state["chat_history"] = []
+    st.session_state["chat_project_metadata"] = {}
+    st.session_state["chat_session_metrics"] = {}
+    st.session_state["chat_last_structured"] = None
+
+
+def _render_metadata_cards(metadata: dict[str, Any]) -> None:
+    cards = metadata_card_specs(metadata)
+    if not cards:
+        st.caption("Aún sin contexto enriquecido. Habla con el modelo o adjunta documentos.")
+        return
+    for card in cards:
+        st.markdown(
+            f"**{card['icon']} {card['label']}**  \n{card['value']}",
+        )
+
+
+def _render_window_indicator(history: list[dict[str, str]]) -> None:
+    in_window = min(len(history), MAX_TURNS)
+    total = len(history)
+    pct = in_window / MAX_TURNS if MAX_TURNS else 0
+    st.markdown("**🪟 Ventana deslizante**")
+    st.progress(min(pct, 1.0))
+    if total > MAX_TURNS:
+        st.caption(
+            f"En ventana: {in_window}/{MAX_TURNS} · Total turnos: {total // 2}. "
+            "Los antiguos se han resumido automáticamente."
+        )
+    else:
+        st.caption(f"En ventana: {in_window}/{MAX_TURNS}")
+
+
+def _render_session_metrics(metrics: dict[str, Any]) -> None:
+    if not metrics:
+        st.caption("Métricas en cuanto envíes el primer turno.")
+        return
+    c1, c2 = st.columns(2)
+    with c1:
+        st.metric("Turnos", metrics.get("turns_count", 0))
+        st.metric("Tokens entrada", metrics.get("input_tokens_total", 0))
+    with c2:
+        st.metric("Llamadas LLM", metrics.get("llm_calls", 0))
+        st.metric("Tokens salida", metrics.get("output_tokens_total", 0))
+    cost = metrics.get("estimated_cost_usd") or 0
+    st.caption(f"Coste estimado: **${cost:.4f}**")
+    if metrics.get("last_model"):
+        st.caption(f"Último modelo: `{metrics['last_model']}` ({metrics.get('last_provider')})")
+
+
+def _clean_summary_markdown(raw: str) -> str:
+    """Si el LLM metió JSON crudo dentro de ``summary_markdown``, extrae solo el texto."""
+    if not raw:
+        return ""
+    text = raw.strip()
+    if text.startswith("{") and text.endswith("}"):
+        try:
+            obj = json.loads(text)
+            inner = obj.get("summary_markdown")
+            if isinstance(inner, str) and inner.strip():
+                return inner.strip()
+        except (json.JSONDecodeError, AttributeError):
+            pass
+    return text
+
+
+_CONFIDENCE_BUCKETS = (
+    (3, "🔴", "baja", "Estimación muy preliminar"),
+    (6, "🟡", "media", "Estimación tentativa"),
+    (10, "🟢", "alta", "Estimación con buena base"),
+)
+
+
+def _confidence_meta(conf: int | None) -> tuple[str, str, str] | None:
+    if conf is None:
+        return None
+    for limit, icon, label, caption in _CONFIDENCE_BUCKETS:
+        if conf <= limit:
+            return icon, label, caption
+    return "🟢", "alta", "Estimación con buena base"
+
+
+_SEVERITY_ICONS = {"low": "🟢", "medium": "🟡", "high": "🔴"}
+
+
+def _render_structured(structured: dict[str, Any] | None, summary_markdown: str) -> None:
+    """Render rico de la estimación estructurada."""
+    if not structured:
+        st.markdown(_clean_summary_markdown(summary_markdown))
+        return
+
+    summary = _clean_summary_markdown(
+        structured.get("summary_markdown") or summary_markdown,
+    )
+    tmin = structured.get("total_hours_min")
+    tmax = structured.get("total_hours_max")
+    line_items = structured.get("line_items") or []
+    phases = structured.get("phases") or []
+    assumptions = structured.get("assumptions") or []
+    risks = structured.get("risks") or []
+    conf = structured.get("confidence")
+    next_step = structured.get("next_step")
+
+    has_numbers = (tmin is not None and tmax is not None) or line_items or phases
+
+    if has_numbers and tmin is not None and tmax is not None:
+        m1, m2, m3 = st.columns(3)
+        m1.metric("⏱️ Horas (mín)", f"{tmin:.0f} h")
+        m2.metric("⏱️ Horas (máx)", f"{tmax:.0f} h")
+        mid = (tmin + tmax) / 2.0
+        m3.metric("📌 Punto medio", f"{mid:.0f} h")
+
+    if summary:
+        st.markdown(summary)
+
+    embedded_tables = parse_markdown_tables(summary)
+    for t in embedded_tables:
+        try:
+            df = pd.DataFrame(t[1:], columns=t[0])
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        except Exception:
+            continue
+
+    if line_items:
+        with st.expander(f"🧱 Line items ({len(line_items)})", expanded=True):
+            df = pd.DataFrame(line_items)
+            preferred = [c for c in ("name", "area", "t_shirt", "hours_min", "hours_max", "description") if c in df.columns]
+            other = [c for c in df.columns if c not in preferred]
+            df = df[preferred + other]
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+    if phases:
+        with st.expander(f"🚦 Fases ({len(phases)})", expanded=True):
+            df = pd.DataFrame(phases)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+
+    if assumptions or risks:
+        col_a, col_r = st.columns(2)
+        with col_a:
+            if assumptions:
+                st.markdown(f"**📝 Supuestos** ({len(assumptions)})")
+                for a in assumptions:
+                    st.markdown(f"- {a.get('text', '')}")
+        with col_r:
+            if risks:
+                st.markdown(f"**⚠️ Riesgos** ({len(risks)})")
+                for r in risks:
+                    sev = r.get("severity")
+                    icon = _SEVERITY_ICONS.get(sev or "", "•")
+                    sev_str = f" _({sev})_" if sev else ""
+                    st.markdown(f"- {icon} {r.get('text', '')}{sev_str}")
+
+    if next_step:
+        st.info(f"👉 **Próximo paso:** {next_step}")
+
+    meta = _confidence_meta(conf)
+    if meta is not None and conf is not None:
+        icon, label, caption = meta
+        st.caption(f"{icon} Confianza **{label}** · {conf}/10 — {caption}")
+
+
+def _attachment_preview(upload) -> tuple[str, str]:
+    """Devuelve ``(tipo, preview)`` para mostrar al usuario antes de enviar."""
+    if is_image_attachment(upload.name, upload.type):
+        return "imagen", f"Imagen `{upload.name}` ({upload.size or 0} bytes)"
+    data = upload.getvalue()
+    res = extract_attachment_text(filename=upload.name, content_type=upload.type, data=data)
+    if res.error:
+        return "error", f"`{upload.name}`: {res.error}"
+    text = res.text.strip()
+    preview = text[:400] + ("…" if len(text) > 400 else "")
+    return "texto", preview
+
+
+def _apply_turn_to_history(
+    *,
+    user_label: str,
+    assistant_text: str,
+    structured: dict[str, Any] | None,
+    command: str,
+) -> None:
+    """Aplica el resultado de un turno al historial del frontend.
+
+    Trata los slash commands especialmente para que el frontend refleje el
+    estado real del backend tras ``/reset``, ``/clear`` o ``/regenerate``.
+    """
+    cmd = command.strip().lower().split(maxsplit=1)[0] if command else ""
+    assistant_turn = {
+        "role": "assistant",
+        "content": assistant_text,
+        "structured": structured,
+    }
+    history = st.session_state["chat_history"]
+
+    if cmd in {"/reset", "/clear"}:
+        history.clear()
+        st.session_state["chat_last_structured"] = None
+        history.append({"role": "user", "content": user_label})
+        history.append(assistant_turn)
+        return
+
+    if cmd == "/regenerate":
+        while history and history[-1]["role"] == "assistant":
+            history.pop()
+        history.append(assistant_turn)
+        return
+
+    history.append({"role": "user", "content": user_label})
+    history.append(assistant_turn)
+
+
+def _http_error_message(err: httpx.HTTPStatusError) -> str:
+    """Extrae el mensaje de error de una respuesta HTTP de forma segura.
+
+    Funciona también con respuestas en streaming, donde ``response.text`` lanza
+    ``ResponseNotRead`` si el cuerpo aún no se ha consumido.
+    """
+    resp = err.response
+    try:
+        resp.read()
+    except Exception:
+        pass
+    try:
+        payload = resp.json()
+        detail = payload.get("detail") if isinstance(payload, dict) else None
+        if detail:
+            return f"HTTP {resp.status_code}: {detail}"
+    except Exception:
+        pass
+    try:
+        body = resp.text
+    except Exception:
+        body = ""
+    return f"HTTP {resp.status_code}: {body[:500]}"
+
+
 with st.sidebar:
-    st.header("Contexto CAG (plantillas)")
-    pv_preview = st.selectbox("Vista previa versión", ("v1", "v2"), index=0, key="sidebar_pv")
+    st.header("Sesión conversacional")
+    sid = st.session_state.get("chat_session_id")
+    st.caption(f"session_id: `{sid or 'sin iniciar'}`")
+
+    if st.button("🆕 Nueva conversación", key="sidebar_reset_chat", use_container_width=True):
+        _reset_chat_session()
+        st.rerun()
+
+    st.subheader("📊 Métricas sesión")
+    _render_session_metrics(st.session_state.get("chat_session_metrics") or {})
+
+    st.subheader("🪟 Ventana deslizante")
+    _render_window_indicator(st.session_state.get("chat_history") or [])
+
+    st.subheader("🗂️ project_metadata")
+    _render_metadata_cards(st.session_state.get("chat_project_metadata") or {})
+
+    st.subheader("⬇️ Exportar")
+    chat_md = conversation_to_markdown(
+        sid,
+        st.session_state.get("chat_history") or [],
+        st.session_state.get("chat_project_metadata") or {},
+        st.session_state.get("chat_session_metrics") or {},
+    )
+    st.download_button(
+        "📄 Markdown",
+        data=chat_md.encode("utf-8"),
+        file_name=f"conversacion-{sid or 'sin-sesion'}.md",
+        mime="text/markdown",
+        use_container_width=True,
+    )
+    st.download_button(
+        "🖨️ PDF",
+        data=conversation_to_pdf(chat_md),
+        file_name=f"conversacion-{sid or 'sin-sesion'}.pdf",
+        mime="application/pdf",
+        use_container_width=True,
+    )
+
+    st.divider()
+    st.header("🔍 System prompt efectivo")
+    show_chat_prompt = st.checkbox("Mostrar prompt actual del chat", value=False)
+    if show_chat_prompt:
+        try:
+            current_pm = ProjectMetadata.model_validate(
+                st.session_state.get("chat_project_metadata") or {},
+            )
+        except Exception:
+            current_pm = ProjectMetadata()
+        try:
+            chat_sys = render_chat_system_prompt(
+                current_pm,
+                version=st.session_state.get("chat_prompt_version", "v1"),
+            )
+        except ValueError as exc:
+            chat_sys = f"(error: {exc})"
+        st.text_area(
+            "chat/{version}/system.j2",
+            value=chat_sys,
+            height=320,
+            disabled=True,
+        )
+
+    st.divider()
+    st.header("Contexto CAG (one-shot)")
+    pv_preview = st.selectbox("Versión one-shot", ("v1", "v2"), index=0, key="sidebar_pv")
     try:
         sys_prev, user_prev = render_estimation_prompt(_DEFAULT_SAMPLE, version=pv_preview)
     except ValueError as e:
         st.error(str(e))
         sys_prev, user_prev = "", ""
-    st.subheader("System (render)")
-    st.text_area("system.j2 renderizado", value=sys_prev, height=260, disabled=True)
-    st.subheader("User (render)")
-    st.text_area("user.j2 renderizado", value=user_prev, height=120, disabled=True)
+    with st.expander("system.j2 renderizado", expanded=False):
+        st.text_area("system", value=sys_prev, height=200, disabled=True, label_visibility="collapsed")
+    with st.expander("user.j2 renderizado", expanded=False):
+        st.text_area("user", value=user_prev, height=120, disabled=True, label_visibility="collapsed")
 
-    st.subheader("Última llamada (métricas)")
-    lm = st.session_state["last_metrics"]
-    if lm:
-        st.metric("Modelo", lm.get("model", "—"))
-        st.caption(f"Proveedor: **{lm.get('provider', '—')}**")
-        c1, c2 = st.columns(2)
-        with c1:
-            st.metric(
-                "Tokens entrada",
-                lm.get("input_tokens") if lm.get("input_tokens") is not None else "—",
-            )
-        with c2:
-            st.metric(
-                "Tokens salida",
-                lm.get("output_tokens") if lm.get("output_tokens") is not None else "—",
-            )
-        elapsed = lm.get("elapsed_ms")
-        if elapsed is not None:
-            st.caption(f"Tiempo de respuesta: **{elapsed:.0f} ms**")
-    else:
-        st.caption(
-            "Las métricas detalladas solo están disponibles en modo streaming local al LLM; "
-            "vía API HTTP no se propagan en esta versión."
-        )
 
-st.title("Estimador de proyectos (CAG + producto)")
+st.title("📋 Estimador de proyectos")
 st.caption(
-    "Formulario tipado contra `POST /estimate` y opcionalmente streaming por `POST /estimate/stream`. "
-    f"API base: `{API_BASE}`"
+    "Conversación con memoria, adjuntos (PDF/DOCX/TXT/imágenes) y salida "
+    f"estructurada. API base: `{API_BASE}`"
 )
 
-tab_form, tab_transcript = st.tabs(["Formulario de producto", "Atajo transcripción"])
+tab_chat, tab_form, tab_transcript = st.tabs(
+    ["💬 Conversación (sesión)", "📝 Formulario de producto", "🎙️ Atajo transcripción"],
+)
+
+with tab_chat:
+    cfg_cols = st.columns([2, 2, 2, 2])
+    with cfg_cols[0]:
+        st.session_state["chat_prompt_version"] = st.selectbox(
+            "Prompt",
+            options=("v1", "v2"),
+            index=0 if st.session_state["chat_prompt_version"] == "v1" else 1,
+            help="v1 estándar, v2 adversarial (cuestiona supuestos).",
+        )
+    with cfg_cols[1]:
+        st.session_state["chat_use_stream"] = st.checkbox(
+            "Streaming",
+            value=st.session_state["chat_use_stream"],
+        )
+    with cfg_cols[2]:
+        st.session_state["chat_use_refine"] = st.checkbox(
+            "Auto-crítica",
+            value=st.session_state["chat_use_refine"],
+            help="Doble pasada de revisión. Duplica latencia y tokens.",
+            disabled=st.session_state["chat_use_stream"],
+        )
+    with cfg_cols[3]:
+        st.caption("Comandos: `/help`, `/reset`, `/metadata`, `/regenerate`.")
+
+    for turn in st.session_state["chat_history"]:
+        with st.chat_message(turn["role"]):
+            if turn.get("structured") and turn["role"] == "assistant":
+                _render_structured(turn["structured"], turn["content"])
+            elif turn["role"] == "assistant":
+                st.markdown(_clean_summary_markdown(turn["content"]))
+            else:
+                st.markdown(turn["content"])
+
+    with st.form("chat_form", clear_on_submit=True):
+        chat_text = st.text_area(
+            "Mensaje al estimador",
+            height=120,
+            help="Describe el proyecto, continúa, o usa un comando `/`.",
+        )
+        chat_files = st.file_uploader(
+            "Adjuntos (PDF, DOCX, TXT, imágenes)",
+            type=["pdf", "docx", "txt", "md", "png", "jpg", "jpeg", "gif", "webp"],
+            accept_multiple_files=True,
+        )
+        if chat_files:
+            with st.expander(f"🔍 Preview de {len(chat_files)} adjunto(s)"):
+                for f in chat_files:
+                    kind, preview = _attachment_preview(f)
+                    if kind == "imagen":
+                        st.image(f, caption=preview, width=160)
+                    elif kind == "error":
+                        st.warning(preview)
+                    else:
+                        st.markdown(f"**`{f.name}`** — {len(preview)} chars (texto extraído):")
+                        st.code(preview, language="markdown")
+        chat_submitted = st.form_submit_button("Enviar turno", use_container_width=True)
+
+    if chat_submitted:
+        cleaned = (chat_text or "").strip()
+        if not cleaned and not chat_files:
+            st.warning("Escribe un mensaje o adjunta un documento.")
+        else:
+            current_sid = _ensure_chat_session()
+            if current_sid:
+                files_payload = [
+                    (
+                        "attachments",
+                        (
+                            upload.name,
+                            upload.getvalue(),
+                            upload.type or "application/octet-stream",
+                        ),
+                    )
+                    for upload in chat_files or []
+                ]
+                data_payload = {"transcript": cleaned}
+                params = {"prompt_version": st.session_state["chat_prompt_version"]}
+                if st.session_state["chat_use_refine"] and not st.session_state["chat_use_stream"]:
+                    params["refine"] = "true"
+
+                if st.session_state["chat_use_stream"]:
+                    stream_url = f"{API_BASE}/sessions/{current_sid}/estimate/stream"
+                    user_label = cleaned or "(adjuntos sin transcript)"
+
+                    with st.chat_message("user"):
+                        st.markdown(user_label)
+
+                    buf = io.StringIO()
+                    final_payload: dict[str, Any] | None = None
+                    start_payload: dict[str, Any] | None = None
+                    stream_error: str | None = None
+
+                    with st.chat_message("assistant"):
+                        placeholder = st.empty()
+                        try:
+                            with httpx.Client(timeout=180.0) as client:
+                                with client.stream(
+                                    "POST",
+                                    stream_url,
+                                    params=params,
+                                    data=data_payload,
+                                    files=files_payload or None,
+                                ) as resp:
+                                    resp.raise_for_status()
+                                    for line in resp.iter_lines():
+                                        if not line:
+                                            continue
+                                        try:
+                                            event = json.loads(line)
+                                        except json.JSONDecodeError:
+                                            continue
+                                        etype = event.get("type")
+                                        if etype == "start":
+                                            start_payload = event
+                                        elif etype == "token":
+                                            buf.write(event.get("delta", ""))
+                                            placeholder.markdown(buf.getvalue() + " ▌")
+                                        elif etype == "final":
+                                            final_payload = event
+                                            placeholder.markdown(event.get("text", buf.getvalue()))
+                                        elif etype == "error":
+                                            stream_error = event.get("error")
+                        except httpx.HTTPStatusError as e:
+                            stream_error = _http_error_message(e)
+                        except httpx.RequestError as e:
+                            stream_error = f"No se pudo contactar la API: {e}"
+
+                    if start_payload and start_payload.get("attachments_failed"):
+                        for f in start_payload["attachments_failed"]:
+                            st.warning(
+                                f"No se pudo procesar `{f.get('filename')}`: {f.get('error')}",
+                            )
+
+                    if stream_error:
+                        st.error(stream_error)
+
+                    if final_payload:
+                        assistant_text = final_payload.get("text", buf.getvalue())
+                        structured = final_payload.get("structured")
+                        _apply_turn_to_history(
+                            user_label=user_label,
+                            assistant_text=assistant_text,
+                            structured=structured,
+                            command=cleaned,
+                        )
+                        st.session_state["chat_project_metadata"] = (
+                            final_payload.get("project_metadata", {})
+                        )
+                        st.session_state["chat_session_metrics"] = (
+                            final_payload.get("metrics", {})
+                        )
+                        st.session_state["chat_last_structured"] = structured
+                        st.rerun()
+                    elif not stream_error:
+                        st.warning(
+                            "El stream terminó sin un evento `final`. "
+                            "El turno no se ha persistido en el historial."
+                        )
+                else:
+                    try:
+                        with httpx.Client(timeout=300.0) as client:
+                            r = client.post(
+                                f"{API_BASE}/sessions/{current_sid}/estimate",
+                                params=params,
+                                data=data_payload,
+                                files=files_payload or None,
+                            )
+                            r.raise_for_status()
+                            data = r.json()
+                        user_label = cleaned or "(adjuntos sin transcript)"
+                        _apply_turn_to_history(
+                            user_label=user_label,
+                            assistant_text=data.get("text", ""),
+                            structured=data.get("structured"),
+                            command=cleaned,
+                        )
+                        st.session_state["chat_project_metadata"] = data.get(
+                            "project_metadata", {},
+                        )
+                        st.session_state["chat_session_metrics"] = data.get(
+                            "metrics", {},
+                        )
+                        st.session_state["chat_last_structured"] = data.get("structured")
+                        failed = data.get("attachments_failed") or []
+                        for f in failed:
+                            st.warning(
+                                f"No se pudo procesar `{f.get('filename')}`: {f.get('error')}",
+                            )
+                        st.rerun()
+                    except httpx.HTTPStatusError as e:
+                        st.error(_http_error_message(e))
+                    except httpx.RequestError as e:
+                        st.error(f"No se pudo contactar la API: {e}")
+
 
 with tab_form:
-    use_stream = st.checkbox("Streaming de respuesta", value=True)
+    use_stream = st.checkbox("Streaming de respuesta", value=True, key="form_stream")
     with st.form("estimation_form", clear_on_submit=False):
         description = st.text_area(
             "Descripción del proyecto",
@@ -192,9 +735,8 @@ with tab_form:
                             "prompt_version": prompt_version,
                             "text": full if isinstance(full, str) else str(full or ""),
                             "streamed": True,
-                        }
+                        },
                     )
-                    st.session_state["last_metrics"] = None
                 else:
                     with httpx.Client(timeout=120.0) as client:
                         r = client.post(
@@ -213,13 +755,13 @@ with tab_form:
                             "prompt_version": data.get("prompt_version", prompt_version),
                             "text": text,
                             "streamed": False,
-                        }
+                        },
                     )
-                    st.session_state["last_metrics"] = None
             except httpx.HTTPStatusError as e:
-                st.error(f"HTTP {e.response.status_code}: {e.response.text}")
+                st.error(_http_error_message(e))
             except httpx.RequestError as e:
                 st.error(f"No se pudo contactar la API: {e}")
+
 
 with tab_transcript:
     st.caption(
@@ -266,7 +808,7 @@ with tab_transcript:
                             "text": full_tr if isinstance(full_tr, str) else str(full_tr or ""),
                             "streamed": True,
                             "source": "transcription",
-                        }
+                        },
                     )
                 else:
                     with httpx.Client(timeout=120.0) as client:
@@ -285,17 +827,17 @@ with tab_transcript:
                             "text": data.get("text", ""),
                             "streamed": False,
                             "source": "transcription",
-                        }
+                        },
                     )
             except httpx.HTTPStatusError as e:
-                st.error(f"HTTP {e.response.status_code}: {e.response.text}")
+                st.error(_http_error_message(e))
             except httpx.RequestError as e:
                 st.error(f"No se pudo contactar la API: {e}")
 
 st.divider()
-st.subheader("Historial de respuestas")
+st.subheader("📜 Historial de estimaciones one-shot")
 if not st.session_state["response_history"]:
-    st.info("Aún no hay estimaciones en esta sesión.")
+    st.info("Aún no hay estimaciones one-shot en esta sesión.")
 else:
     for i, item in enumerate(reversed(st.session_state["response_history"]), start=1):
         with st.expander(f"#{len(st.session_state['response_history']) - i + 1} — {item.get('prompt_version', '?')}"):

@@ -1,8 +1,32 @@
 # Estimador CAG (FastAPI + Streamlit)
 
-API REST que genera **estimaciones de software** con un LLM usando **CAG** (contexto estático): las instrucciones y ejemplos few-shot viven en plantillas **Jinja2** versionadas (`v1`, `v2`), no en código Python disperso. El servicio admite **OpenAI** o **Anthropic** según configuración, **caché exact-match** sobre la petición serializada y, opcionalmente, **respuesta en streaming**.
+API REST que genera **estimaciones de software** con un LLM usando **CAG** (contexto estático): las instrucciones y ejemplos few-shot viven en plantillas **Jinja2** versionadas (`v1`, `v2`, y la familia `chat/v1` / `chat/v2` para conversaciones), no en código Python disperso. El servicio admite **OpenAI** o **Anthropic** según configuración, **caché exact-match** sobre la petición serializada y **respuesta en streaming**.
 
-La interfaz **Streamlit** envía el mismo contrato JSON que la API (formulario tipado + historial + streaming HTTP), de modo que no se duplica la lógica de prompts ni de proveedores en el cliente.
+A partir de la sesión 05 incorpora **memoria conversacional**, **adjuntos** (PDF / DOCX / TXT) y un **`project_metadata`** que se inyecta dinámicamente en el system prompt y se va enriqueciendo turno a turno.
+
+**Mejoras adicionales sobre esa base (este sprint):**
+
+| Categoría | Mejora |
+|-----------|--------|
+| Calidad | Salida **JSON estructurada** (Pydantic) con `line_items`, `phases`, `assumptions`, `risks`, `confidence`. |
+| Calidad | **Calibración T-shirt sizing** (XS–XL) inyectada en el system prompt. |
+| Calidad | **Few-shot dinámico** por `project_type` (`mobile_app`, `web_saas`, `internal_tool`, `data_pipeline`). |
+| Calidad | Bandera `?refine=true` para una **pasada de auto-crítica** antes de devolver la estimación. |
+| Calidad | Extractor LLM opcional de `project_metadata` y **resumen automático** al rotar la ventana deslizante. |
+| Funcional | **Streaming NDJSON** para el chat conversacional (`/sessions/{id}/estimate/stream`). |
+| Funcional | **Caché SHA-256** y **límites duros** para adjuntos (tamaño y cantidad). |
+| Funcional | **Vision** (PNG/JPEG/GIF/WEBP) por Camino A multimodal. |
+| Funcional | `GET /sessions/{id}` para **rehidratar** historial + metadata + métricas. |
+| Funcional | **Comandos `/`** en el chat: `/reset`, `/metadata`, `/regenerate`, `/help`. |
+| Funcional | Versión `chat/v2` con filosofía **adversarial** (cuestiona supuestos). |
+| Funcional | Exportar conversación a **Markdown / PDF**. |
+| UX | Tarjetas con iconos para `project_metadata`, indicador de ventana deslizante, render de tablas como `st.dataframe`, preview de adjuntos antes de enviar, system prompt efectivo en sidebar, theming corporativo. |
+| Observ. | **Métricas por sesión** (tokens, llamadas LLM, coste estimado USD, latencia). |
+| Observ. | **Self-confidence score** del modelo en cada turno. |
+| Observ. | **Eval set** de briefs canónicos en `app/eval/`. |
+| Robustez | **TTL + GC** de sesiones inactivas, **CI GitHub Actions** con tests y `ruff`. |
+
+La interfaz **Streamlit** envía el mismo contrato HTTP que la API (formulario tipado + historial + streaming + pestaña conversacional con adjuntos y streaming), sin duplicar la lógica de prompts ni de proveedores en el cliente.
 
 ## Requisitos
 
@@ -33,6 +57,9 @@ Copy-Item .env.example .env
 | `ANTHROPIC_API_KEY` | Obligatoria si `LLM_PROVIDER=anthropic`. |
 | `OPENAI_MODEL` | ID del modelo OpenAI (por defecto `gpt-4o-mini`). |
 | `ANTHROPIC_MODEL` | ID del modelo Anthropic (por defecto `claude-3-5-haiku-20241022`). |
+| `ENABLE_AUTO_SUMMARY` | `true`/`false`. Llama al LLM al rotar la ventana para mantener un resumen del histórico. Por defecto `true`. |
+| `ENABLE_LLM_METADATA` | `true`/`false`. Tras cada turno hace una llamada extra al LLM para enriquecer `project_metadata`. Por defecto `false` (la heurística regex sigue activa siempre). |
+| `SESSION_TTL_SECONDS` | TTL de inactividad antes de descartar una sesión. Por defecto 24 h. |
 
 Solo necesitas rellenar la clave del proveedor que elijas; la otra puede quedar vacía.
 
@@ -159,33 +186,182 @@ curl -N -X POST "http://127.0.0.1:8000/estimate/stream?prompt_version=v1" \
   -d '{"description":"MVP de reservas con notificaciones y panel admin mínimo.","project_type":"mobile_app","detail_level":"summary","output_format":"narrative"}'
 ```
 
+### Sesiones conversacionales (memoria + adjuntos)
+
+Pensadas para iterar varias rondas con el mismo proyecto. El servidor mantiene un **historial con ventana deslizante** (`MAX_TURNS = 6`) y un **`project_metadata`** acumulativo (nombre del proyecto, tamaño de equipo asumido, tecnologías mencionadas y alcance acordado) que se **re-inyecta en el system prompt en cada turno** vía Jinja2 (`app/prompts/chat/v1/system.j2`).
+
+#### `POST /sessions`
+
+Crea una sesión nueva en memoria. Devuelve `{"session_id": "<uuid4>"}`.
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/sessions
+```
+
+#### `POST /sessions/{session_id}/estimate`
+
+Recibe **`multipart/form-data`**:
+
+| Campo | Tipo | Notas |
+|-------|------|-------|
+| `transcript` | string (form) | Mensaje del usuario. Vacío permitido si hay adjunto. |
+| `attachments` | files (opcional) | Uno o varios PDF / DOCX / TXT / MD / **imágenes** (PNG, JPEG, GIF, WEBP). |
+
+Query opcionales:
+
+| Param | Tipo | Notas |
+|-------|------|-------|
+| `prompt_version` | `v1` / `v2` | Selecciona el system prompt del chat. `v2` es **adversarial**. |
+| `refine` | bool | Si `true`, hace una segunda pasada de **auto-crítica** antes de responder. |
+
+Devuelve un JSON con:
+
+- `text`: resumen markdown (igual a `structured.summary_markdown`).
+- `structured`: estimación tipada (`line_items`, `phases`, `assumptions`, `risks`, `total_hours_min/max`, `confidence`, `next_step`).
+- `structured_ok`: `true` si el LLM devolvió JSON válido (si no, `text` mantiene la respuesta cruda).
+- `refined`: `true` si se ejecutó la auto-crítica.
+- `project_metadata`: incluido `conversation_summary` cuando ha habido overflow.
+- `metrics`: acumulado de la sesión (`turns_count`, `llm_calls`, tokens, `estimated_cost_usd`).
+- `attachments_processed` / `attachments_failed`.
+
+```bash
+curl -s -X POST "http://127.0.0.1:8000/sessions/$SID/estimate?prompt_version=v2&refine=true" \
+  -F "transcript=El proyecto se llama Aurora. Vamos a usar Python y FastAPI." \
+  -F "attachments=@spec.pdf;type=application/pdf"
+```
+
+##### Comandos `/`
+
+Si `transcript` empieza por `/`, **no se llama al LLM**:
+
+| Comando | Acción |
+|---------|--------|
+| `/help` | Lista todos los comandos. |
+| `/reset` (alias `/clear`) | Vacía historial y metadata, mantiene `session_id`. |
+| `/metadata` | Muestra el `project_metadata` actual. |
+| `/regenerate` | Descarta la última respuesta y vuelve a llamar al LLM con el mismo turno. |
+
+#### `POST /sessions/{session_id}/estimate/stream`
+
+Mismo body que arriba. Devuelve **NDJSON** (`application/x-ndjson`):
+
+```json
+{"type": "start", "session_id": "…", "attachments_processed": ["a.pdf"], "attachments_failed": []}
+{"type": "token", "delta": "## Plan v1\n"}
+{"type": "token", "delta": "- Auth (S, 16–40h)\n"}
+{"type": "final", "text": "## Plan v1…", "structured": {...}, "structured_ok": true, "project_metadata": {...}, "metrics": {...}}
+```
+
+#### `GET /sessions/{session_id}`
+
+Rehidrata historial, `project_metadata` y métricas de la sesión.
+
+##### Decisiones de diseño
+
+- **Adjuntos de texto: Camino B (extracción local).** El servidor extrae texto con `pypdf` (PDF) o `python-docx` (DOCX) y lo concatena al transcript con el separador `--- attachment: <nombre> ---`. Compatible 1:1 con OpenAI y Anthropic.
+- **Adjuntos imagen: Camino A (multimodal).** PNG/JPEG/GIF/WEBP se codifican en base64 e **inyectan** en el último user message como contenido multimodal en el formato propio de cada proveedor (`image_url` para OpenAI, `image` block para Anthropic). Ver `app/services/llm_service.py::_inject_images_*`.
+- **Caché de adjuntos por SHA-256.** El mismo binario re-subido en turnos posteriores se sirve desde caché in-process (`app/services/attachments.py::_TEXT_CACHE`).
+- **Límites duros de adjuntos.** Máximo `MAX_ATTACHMENT_BYTES = 10 MB` por archivo y `MAX_ATTACHMENTS_PER_TURN = 5` por turno.
+- **Extracción de `project_metadata`:** **doble vía**:
+  1. **Heurística regex** (siempre activa): catálogo cerrado de tecnologías + patrones para nombre de proyecto, tipo (`mobile_app`/`web_saas`/`internal_tool`/`data_pipeline`), tamaño de equipo y alcance.
+  2. **Extractor LLM** (opt-in vía `ENABLE_LLM_METADATA=true`): tras cada turno hace una segunda llamada ligera que devuelve un JSON con campos refinados; se **fusiona** con la heurística sin pisar lo ya acordado.
+- **Resumen al rotar ventana** (`ENABLE_AUTO_SUMMARY=true` por defecto): cuando un par user+assistant cae de la ventana, se llama al LLM con un summarizer ligero para acumular `conversation_summary` en `ProjectMetadata`. Si la llamada falla, el resumen previo se conserva.
+- **Few-shot dinámico:** `app/prompts/chat/v1/examples/{project_type}.j2`. La versión `v2` reutiliza los mismos ejemplos por fallback.
+- **Salida estructurada:** el system prompt instruye al LLM a devolver un JSON con un schema fijo. Si el LLM devuelve markdown libre, `parse_structured_response` cae a un fallback que copia todo a `summary_markdown` sin romper el contrato.
+- **Estado.** Diccionario global en memoria (`SessionStore`); sin BBDD ni Redis. Una tarea de fondo (`_session_gc_loop` en `app/main.py`) limpia cada minuto las sesiones inactivas según `SESSION_TTL_SECONDS`.
+
 ### Caché y versiones de prompt
 
-- **Caché exact-match:** si dos peticiones tienen el mismo JSON canónico (mismos campos y valores) y la misma `prompt_version`, la segunda puede devolver el texto cacheado sin llamar otra vez al LLM.
-- **Versiones:** `v1` y `v2` corresponden a carpetas bajo `app/prompts/estimation/`. Puedes añadir más versiones ampliando el loader y las plantillas.
+- **Caché exact-match** sobre `/estimate` (one-shot). Las sesiones conversacionales no se cachean porque cada turno depende del historial.
+- **Versiones:** `v1` y `v2` viven en `app/prompts/estimation/`; los system prompts conversacionales están en `app/prompts/chat/v1/` (estándar) y `app/prompts/chat/v2/` (adversarial). Para añadir una versión nueva basta con crear la carpeta y registrar la versión en `_VALID_CHAT_VERSIONS`.
 
 ## Tests
 
-Sin llamadas a APIs externas (solo render Jinja):
+Sin llamadas a APIs externas: los tests de sesiones mockean el wrapper LLM con `monkeypatch`, y los tests de prompts solo renderizan Jinja2.
 
 ```bash
-uv run pytest tests/prompts/test_estimation_v1.py -v
+uv run pytest tests/ -v
 ```
+
+O con el venv activado:
+
+```bash
+.\.venv\Scripts\python -m pytest tests/ -v
+```
+
+Cobertura incluida (74 tests, < 1 s):
+
+| Test | Qué cubre |
+|------|-----------|
+| `tests/prompts/test_estimation_v1.py` | Render de plantillas `estimation/v1`. |
+| `tests/test_sessions_metadata.py` | Dos turnos → `project_metadata` cambia. |
+| `tests/test_sessions_attachments.py` | PDF como adjunto cambia la estimación. |
+| `tests/test_sessions_sliding_window.py` | 8 turnos → nunca supera `MAX_TURNS`. |
+| `tests/test_structured_output.py` | Parseo del JSON estructurado + fallbacks. |
+| `tests/test_fewshot_dynamic.py` | Detector de `project_type` y bloque de ejemplos. |
+| `tests/test_sessions_stream.py` | `/estimate/stream` emite `start` / `token` / `final`; `GET /sessions/{id}`. |
+| `tests/test_attachments_cache_and_limits.py` | Caché SHA-256, límites de tamaño y cantidad. |
+| `tests/test_slash_commands.py` | `/reset`, `/metadata`, `/regenerate`, comando desconocido. |
+| `tests/test_vision_attachments.py` | Detección de imagen + inyección multimodal (OpenAI/Anthropic). |
+| `tests/test_refine.py` | `?refine=true` dispara segunda llamada. |
+| `tests/test_metadata_llm_and_summary.py` | Extractor LLM + resumen automático al overflow. |
+| `tests/test_chat_v2.py` | Versión adversarial del prompt. |
+| `tests/test_session_ttl.py` | `evict_inactive` borra solo las antiguas. |
+| `tests/test_session_metrics.py` | Acumulado de tokens y coste estimado. |
+| `tests/test_eval_set.py` | Eval set canónico ejecutable con LLM mockeado. |
+| `tests/test_frontend_utils.py` | Tarjetas, parseo de tablas markdown y export Markdown/PDF. |
+
+Los tests asíncronos usan `httpx.AsyncClient` sobre el ASGI de FastAPI (sin levantar uvicorn).
+
+### Lint
+
+```bash
+.\.venv\Scripts\python -m ruff check app/ tests/ streamlit_app.py
+```
+
+Configuración en `pyproject.toml` (selección `E F I B UP W` + ignores razonables).
+
+### CI
+
+GitHub Actions (`.github/workflows/ci.yml`) ejecuta los tests en Python 3.11 y 3.12 + `ruff check` en cada push y PR.
+
+### Eval set
+
+```bash
+.\.venv\Scripts\python -m app.eval.runner --out eval-report.json
+```
+
+Briefs canónicos en `app/eval/briefs.py`; el runner verifica `project_type` detectado, tecnologías esperadas, temas requeridos, totales dentro de rango y `confidence`. **Requiere LLM real** (las claves del `.env`).
 
 ## Estructura del proyecto (resumen)
 
 | Ruta | Rol |
 |------|-----|
-| `app/main.py` | FastAPI, configuración mínima de `structlog`. |
+| `app/main.py` | FastAPI + `lifespan` con GC de sesiones inactivas. |
 | `app/config.py` | Ajustes desde entorno (`pydantic-settings`). |
 | `app/schemas.py` | Modelos Pydantic de entrada y salida. |
+| `app/structured.py` | `StructuredEstimation` y parseo tolerante del JSON del LLM. |
+| `app/sessions.py` | `ConversationHistory`, `ProjectMetadata`, `Session`, `SessionMetrics`, `SessionStore`. |
 | `app/routers/estimations.py` | `POST /estimate` y `POST /estimate/stream`. |
-| `app/prompts/loader.py` | Render de `system.j2` + `user.j2` por versión. |
-| `app/prompts/estimation/v1/` … `v2/` | Plantillas Jinja2 (CAG versionado). |
-| `app/services/llm_service.py` | Wrapper multi-proveedor (mensajes system + user). |
-| `app/services/estimate_service.py` | Orquestación: render, caché, llamada al LLM. |
-| `streamlit_app.py` | Formulario, streaming HTTP e historial. |
-| `tests/prompts/` | Tests del render de plantillas. |
+| `app/routers/sessions.py` | Endpoints conversacionales (sync, streaming, GET). |
+| `app/prompts/loader.py` | Render de plantillas one-shot y de chat con few-shot dinámico. |
+| `app/prompts/estimation/v1/` … `v2/` | Plantillas Jinja2 one-shot. |
+| `app/prompts/chat/v1/` | System prompt estándar + `examples/` por dominio + `refine.j2`. |
+| `app/prompts/chat/v2/` | Versión adversarial. |
+| `app/services/llm_service.py` | Wrapper multi-proveedor + streaming + inyección multimodal. |
+| `app/services/estimate_service.py` | Orquestación one-shot: render, caché, llamada al LLM. |
+| `app/services/session_service.py` | Orquestación por turno (adjuntos → historial → LLM → metadata → métricas). |
+| `app/services/attachments.py` | Extracción local de texto + caché SHA-256 + codificación de imágenes. |
+| `app/services/metadata_extractor.py` | Heurística regex para `ProjectMetadata` (incluye `project_type`). |
+| `app/services/metadata_llm.py` | Extractor LLM + summarizer del overflow. |
+| `app/services/slash_commands.py` | Dispatcher de comandos `/`. |
+| `app/services/cost.py` | Tabla de precios por modelo (USD por 1K tokens). |
+| `app/eval/` | Eval set de briefs canónicos. |
+| `app/frontend_utils.py` | Tarjetas, parseo de tablas markdown y export Markdown/PDF. |
+| `.streamlit/config.toml` | Theming corporativo. |
+| `streamlit_app.py` | Pestañas: conversación con adjuntos/streaming, formulario, transcripción, historial, sidebar con métricas y `system` prompt efectivo. |
+| `tests/` | Tests async sin red, con LLM mockeado. |
+| `.github/workflows/ci.yml` | Tests + ruff en GitHub Actions. |
 
 El archivo `app/context/examples.py` es legado del primer ejercicio; los ejemplos few-shot activos están en los `.j2` dentro de `app/prompts/`.
 

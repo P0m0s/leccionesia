@@ -17,5 +17,25 @@ class Settings(BaseSettings):
     openai_model: str = Field(default="gpt-4o-mini")
     anthropic_model: str = Field(default="claude-3-5-haiku-20241022")
 
+    enable_llm_metadata: bool = Field(
+        default=False,
+        description=(
+            "Si True, tras cada turno se hace una segunda llamada LLM ligera "
+            "para enriquecer ProjectMetadata. Activarlo gasta tokens extra."
+        ),
+    )
+    enable_auto_summary: bool = Field(
+        default=True,
+        description=(
+            "Si True, al desbordar la ventana deslizante se llama al LLM para "
+            "generar un resumen comprimido que se incorpora a "
+            "ProjectMetadata.conversation_summary."
+        ),
+    )
+    session_ttl_seconds: int = Field(
+        default=24 * 3600,
+        description="Tiempo sin actividad tras el cual una sesión se descarta.",
+    )
+
 
 settings = Settings()

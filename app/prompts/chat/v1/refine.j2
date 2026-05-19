@@ -1,0 +1,12 @@
+Revisa tu propia respuesta anterior con ojo crítico. Identifica:
+
+1. **Supuestos no marcados**: cifras, integraciones, decisiones tecnológicas o de equipo que diste por hecho sin marcar como `assumption`.
+2. **Riesgos faltantes**: dependencias externas, compliance, escala, talento, deuda técnica que no aparecen en `risks`.
+3. **Números sin justificar**: line items cuyo rango (`hours_min`/`hours_max`) parezca arbitrario o no coherente con la talla T-shirt declarada.
+4. **Inconsistencias internas**: line items que se solapan, fases sin dependencias claras, totales que no cuadran con la suma de ítems.
+
+A continuación **reescribe la estimación completa** corrigiendo lo identificado.
+
+- Devuelve UN ÚNICO objeto JSON con el mismo schema (ya conocido en el system prompt).
+- Mantén el `summary_markdown` claro y, si lo deseas, añade una sección final `## Cambios respecto a la versión anterior` con 3–5 viñetas.
+- Si la versión anterior ya era sólida, indícalo brevemente en el `summary_markdown` y devuelve la misma estimación con `confidence` ligeramente más alta.

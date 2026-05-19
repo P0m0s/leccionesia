@@ -1,0 +1,23 @@
+## Ejemplos de referencia (estilo, no copies cifras) — dominio **web_saas**
+
+### Ejemplo — SaaS B2B multi-tenant
+**Entrada:** "Plataforma SaaS para gestión de incidencias con tenants aislados, SSO, planes de suscripción y reporting."
+
+**Áreas típicas a incluir como line_items:**
+- Tenancy + aislamiento de datos (M–L)
+- Auth + SSO (Google, Microsoft, SAML opcional) (M)
+- Facturación recurrente (Stripe Billing / Chargebee) (M)
+- Módulo funcional core (incidencias, flujos) (L–XL)
+- Reporting y dashboards (M)
+- Onboarding self-service (S–M)
+
+**Riesgos típicos del dominio:**
+- Migraciones de schema multi-tenant.
+- Latencia con clientes globales (CDN, edge).
+- Cumplimiento (RGPD, residencia de datos por región).
+- Coste de infra cuando el plan free no está bien dimensionado.
+
+**Supuestos a marcar:**
+- ¿Multi-tenant compartido o silo por tenant?
+- ¿RBAC simple o ABAC por recurso?
+- ¿SLAs comprometidos en contrato?

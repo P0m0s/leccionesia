@@ -141,6 +141,24 @@ def _accumulate_metrics(
     sm.images_processed_total += n_images
 
 
+def _count_anchors(meta: ProjectMetadata) -> int:
+    """Cuenta campos no vacíos de ProjectMetadata que actúan como anclas de contexto."""
+    count = 0
+    if meta.project_name:
+        count += 1
+    if meta.project_type:
+        count += 1
+    if meta.assumed_team_size is not None:
+        count += 1
+    if meta.mentioned_technologies:
+        count += 1
+    if meta.agreed_scope:
+        count += 1
+    if meta.conversation_summary:
+        count += 1
+    return count
+
+
 def run_session_turn(
     *,
     session: Session,
@@ -188,6 +206,7 @@ def run_session_turn(
     structured, structured_ok = parse_structured_response(raw_text)
     visible_text = structured.summary_markdown or raw_text
     refined = False
+    refine_metrics: dict[str, Any] = {}
 
     if refine:
         critique_prompt = render_chat_refine_prompt(version=prompt_version)
@@ -228,6 +247,34 @@ def run_session_turn(
         n_phases=len(structured.phases),
         confidence=structured.confidence,
         refined=refined,
+    )
+
+    turn_tokens_in = int(metrics.get("input_tokens") or 0)
+    turn_tokens_out = int(metrics.get("output_tokens") or 0)
+    turn_latency = float(metrics.get("elapsed_ms") or 0.0)
+    if refined:
+        turn_tokens_in += int(refine_metrics.get("input_tokens") or 0)
+        turn_tokens_out += int(refine_metrics.get("output_tokens") or 0)
+        turn_latency += float(refine_metrics.get("elapsed_ms") or 0.0)
+
+    att_chars = sum(len(a.text or "") for a in attachments)
+    turn_cost = estimate_cost_usd(model, turn_tokens_in, turn_tokens_out)
+
+    logger.info(
+        "turn_observed",
+        turn_index=session.metrics.turns_count,
+        session_id=session.session_id,
+        enriched_transcript_chars=len(augmented),
+        attachments_total_chars=att_chars,
+        messages_in_window=len(session.history.messages),
+        anchors_count=_count_anchors(session.project_metadata),
+        summary_chars=len(session.project_metadata.conversation_summary or ""),
+        tokens_in=turn_tokens_in,
+        tokens_out=turn_tokens_out,
+        cost_usd=turn_cost or 0.0,
+        latency_ms=turn_latency,
+        cache_hit_kind="none",
+        last_resolved_tier=None,
     )
 
     return SessionTurnResult(

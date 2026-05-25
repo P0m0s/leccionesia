@@ -15,3 +15,5 @@ build/
 htmlcov/
 .mypy_cache/
 .ruff_cache/
+evals/stress/fixtures/*.pdf
+evals/stress/results.csv

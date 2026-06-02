@@ -1,0 +1,1 @@
+"""CLI auxiliar del proyecto."""

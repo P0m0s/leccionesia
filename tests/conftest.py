@@ -14,6 +14,7 @@ from app.config import settings
 from app.main import app
 from app.services.attachments import reset_cache
 from app.sessions import session_store
+from vector_store import vector_store
 
 
 @pytest.fixture(autouse=True)
@@ -26,8 +27,10 @@ def _reset_sessions(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     session_store.reset()
     reset_cache()
+    vector_store.reset()
     monkeypatch.setattr(settings, "enable_auto_summary", False)
     monkeypatch.setattr(settings, "enable_llm_metadata", False)
+    monkeypatch.setattr(settings, "embedding_backend", "local")
 
 
 @pytest.fixture

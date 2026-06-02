@@ -6,8 +6,9 @@ import structlog
 from fastapi import FastAPI
 
 from app.config import settings
-from app.routers import estimations, sessions
+from app.routers import embeddings, estimations, sessions
 from app.sessions import session_store
+from vector_store import vector_store
 
 structlog.configure(
     processors=[
@@ -43,6 +44,8 @@ async def _session_gc_loop() -> None:
 
 @contextlib.asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    if settings.vector_store_path:
+        vector_store.load(settings.vector_store_path)
     task = asyncio.create_task(_session_gc_loop())
     try:
         yield
@@ -64,6 +67,7 @@ app = FastAPI(
 
 app.include_router(estimations.router)
 app.include_router(sessions.router)
+app.include_router(embeddings.router)
 
 
 @app.get("/health")

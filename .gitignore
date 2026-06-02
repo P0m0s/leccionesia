@@ -17,3 +17,4 @@ htmlcov/
 .ruff_cache/
 evals/stress/fixtures/*.pdf
 evals/stress/results.csv
+data/vector_store.json

@@ -60,6 +60,10 @@ Copy-Item .env.example .env
 | `ENABLE_AUTO_SUMMARY` | `true`/`false`. Llama al LLM al rotar la ventana para mantener un resumen del histórico. Por defecto `true`. |
 | `ENABLE_LLM_METADATA` | `true`/`false`. Tras cada turno hace una llamada extra al LLM para enriquecer `project_metadata`. Por defecto `false` (la heurística regex sigue activa siempre). |
 | `SESSION_TTL_SECONDS` | TTL de inactividad antes de descartar una sesión. Por defecto 24 h. |
+| `EMBEDDING_BACKEND` | `openai` o `local` para el pipeline de búsqueda semántica. |
+| `EMBEDDING_MODEL` | Modelo OpenAI de embeddings (por defecto `text-embedding-3-small`). |
+| `EMBEDDING_BATCH_SIZE` | Lote para `embed_many` (por defecto 100). |
+| `VECTOR_STORE_PATH` | JSON opcional para cargar/guardar el vector store entre reinicios. |
 
 Solo necesitas rellenar la clave del proveedor que elijas; la otra puede quedar vacía.
 
@@ -114,6 +118,88 @@ uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 
 - Documentación interactiva: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
 - Salud: `GET http://127.0.0.1:8000/health`
+
+## Pipeline de embeddings y búsqueda semántica (pre-session-06)
+
+Pipeline mínimo para indexar documentos y recuperar fragmentos por similitud coseno:
+
+1. **Chunking** (`chunking.py`) — trocea el texto con `tiktoken` (`cl100k_base`) respetando `max_tokens` (por defecto 300) sin partir palabras. Cada chunk lleva metadatos `chunk_id`, `start_char`, `end_char`.
+2. **Embeddings** (`embeddings_service.py`) — `EmbeddingService` expone `embed_text` y `embed_many` (con batching). Por defecto usa OpenAI `text-embedding-3-small`; en tests o sin API puedes usar `EMBEDDING_BACKEND=local` (vectores deterministas).
+3. **Vector store** (`vector_store.py`) — `InMemoryVectorStore` guarda `{embedding, metadata}` en memoria y busca por **similitud coseno**. Persistencia opcional en JSON (`save` / `load`).
+
+### Indexar documentos
+
+**HTTP — `POST /embed`**
+
+```json
+{ "text": "contenido del documento" }
+```
+
+Respuesta:
+
+```json
+{ "chunks_indexed": 3, "store_size": 3 }
+```
+
+**CLI**
+
+```bash
+uv run python -m cli.index --file ruta.txt
+# opcional: persistir en disco
+uv run python -m cli.index --file ruta.txt --persist data/vector_store.json
+```
+
+Si defines `VECTOR_STORE_PATH` en `.env`, la API carga ese JSON al arrancar.
+
+### Buscar
+
+**`POST /search`**
+
+```json
+{ "query": "texto de búsqueda", "k": 5 }
+```
+
+Respuesta:
+
+```json
+{
+  "results": [
+    {
+      "score": 0.87,
+      "chunk": "fragmento recuperado…",
+      "metadata": { "chunk_id": 0, "start_char": 0, "end_char": 42 }
+    }
+  ]
+}
+```
+
+Ejemplo con curl:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/embed \
+  -H "Content-Type: application/json" \
+  -d '{"text":"FastAPI con PostgreSQL y migraciones Alembic."}'
+
+curl -s -X POST http://127.0.0.1:8000/search \
+  -H "Content-Type: application/json" \
+  -d '{"query":"API Python FastAPI","k":3}'
+```
+
+### Limitaciones del vector store
+
+- **En memoria**: un solo proceso; reiniciar el servidor vacía el store salvo que uses `VECTOR_STORE_PATH`.
+- **Sin filtros**: no hay metadata filtering ni namespaces; todos los chunks comparten la misma lista.
+- **Sin deduplicación**: volver a llamar `/embed` añade chunks nuevos (no reemplaza por documento).
+- **Escala**: adecuado para demos y pruebas; producción requeriría un store externo (pgvector, Pinecone, etc.).
+
+### Cambiar el modelo de embeddings
+
+| Variable | Descripción |
+|----------|-------------|
+| `EMBEDDING_BACKEND` | `openai` (por defecto) o `local` (sin API). |
+| `EMBEDDING_MODEL` | ID del modelo OpenAI (p. ej. `text-embedding-3-small`, `text-embedding-3-large`). |
+| `EMBEDDING_BATCH_SIZE` | Tamaño de lote para `embed_many` (por defecto 100). |
+| `OPENAI_API_KEY` | Obligatoria si `EMBEDDING_BACKEND=openai`. |
 
 **Terminal 2 — Interfaz Streamlit** (con la API ya levantada)
 

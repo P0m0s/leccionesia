@@ -84,3 +84,27 @@ class SessionStateResponse(BaseModel):
     messages: list[dict]
     max_turns: int
     metrics: dict = Field(default_factory=dict)
+
+
+class EmbedRequest(BaseModel):
+    text: str = Field(min_length=1, description="Contenido del documento a indexar.")
+
+
+class EmbedResponse(BaseModel):
+    chunks_indexed: int
+    store_size: int
+
+
+class SearchRequest(BaseModel):
+    query: str = Field(min_length=1)
+    k: int = Field(default=5, ge=1, le=50)
+
+
+class SearchResultItem(BaseModel):
+    score: float
+    chunk: str
+    metadata: dict
+
+
+class SearchResponse(BaseModel):
+    results: list[SearchResultItem]

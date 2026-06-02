@@ -37,5 +37,22 @@ class Settings(BaseSettings):
         description="Tiempo sin actividad tras el cual una sesión se descarta.",
     )
 
+    embedding_backend: Literal["openai", "local"] = Field(
+        default="openai",
+        description="Proveedor de embeddings: OpenAI API o local determinista (tests).",
+    )
+    embedding_model: str = Field(
+        default="text-embedding-3-small",
+        description="Modelo OpenAI para embeddings cuando embedding_backend=openai.",
+    )
+    embedding_batch_size: int = Field(
+        default=100,
+        description="Tamaño de lote para embed_many con OpenAI.",
+    )
+    vector_store_path: str | None = Field(
+        default=None,
+        description="Ruta JSON opcional para persistir/cargar el vector store en disco.",
+    )
+
 
 settings = Settings()
